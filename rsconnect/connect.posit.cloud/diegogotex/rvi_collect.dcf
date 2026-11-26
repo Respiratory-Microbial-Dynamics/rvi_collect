@@ -1,0 +1,11 @@
+name: rvi_collect
+title:
+username: diegogotex
+account: diegogotex
+server: connect.posit.cloud
+hostUrl: https://api.connect.posit.cloud/v1
+appId: 01a2187e-19ac-f7c6-f9f9-75bf9429fc5c
+appGuid:
+bundleId:
+url: https://connect.posit.cloud/diegogotex/content/01a2187e-19ac-f7c6-f9f9-75bf9429fc5c
+version: 1

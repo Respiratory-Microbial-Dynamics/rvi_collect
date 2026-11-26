@@ -18,6 +18,8 @@
   button { cursor: pointer; padding: 7px 11px; border: 1px solid #176258; border-radius: 5px; background: #176258; color: white; }
   button:disabled { opacity: .45; cursor: default; }
   .toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin: 12px 0; }
+  .page-size { display: flex; align-items: center; gap: 8px; margin: 0 0 0 auto; }
+  .page-size select { width: auto; margin: 0; }
   .range { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
   .scroll { overflow: auto; max-height: 65vh; border: 1px solid #d9e3e1; border-radius: 5px; }
   table { border-collapse: separate; border-spacing: 0; min-width: 100%; }
@@ -68,6 +70,14 @@
     <div class="toolbar">
       <button id="tsv" disabled>Metadata (.tsv)</button>
       <button id="script" disabled hidden>Collect FASTA (.sh)</button>
+      <label class="page-size">Rows per page
+        <select id="pageSize">
+          <option value="10" selected>10</option>
+          <option value="100">100</option>
+          <option value="1000">1000</option>
+          <option value="all">All</option>
+        </select>
+      </label>
     </div>
     <div class="scroll" tabindex="0" aria-label="Results table">
       <table><thead id="head"></thead><tbody id="body"></tbody></table>
@@ -92,7 +102,6 @@ const required = {
 const data = { metadata: null, classification: null };
 const errors = {};
 const checked = new Set();
-const pageSize = 25;
 let rows = [], fields = [], exported = [], paths = [];
 let page = 0, sortField = "", ascending = true;
 
@@ -302,6 +311,7 @@ function render() {
   $("script").hidden = !combined;
   $("script").disabled = !paths.length;
 
+  const pageSize = $("pageSize").value === "all" ? Math.max(1, filtered.length) : Number($("pageSize").value);
   const pageCount = Math.ceil(filtered.length / pageSize);
   page = Math.min(page, Math.max(0, pageCount - 1));
   $("prev").disabled = page === 0;
@@ -419,7 +429,7 @@ for (const id of ["metadata", "classification"]) {
   };
 }
 for (const id of ["view", "dedup"]) $(id).onchange = refreshData;
-for (const id of ["origin", "columns", "virus", "manual"]) {
+for (const id of ["origin", "columns", "virus", "manual", "pageSize"]) {
   $(id).onchange = () => { page = 0; render(); };
 }
 for (const id of ["samples", "search", "min", "max"]) {
