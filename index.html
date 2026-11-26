@@ -1,0 +1,449 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RVI Collect</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #f2f5f5; color: #153433; font: 15px system-ui, sans-serif; }
+  header, main { max-width: 1700px; margin: auto; padding: 22px; }
+  h1 { margin: 0; font-size: 28px; }
+  main { display: grid; grid-template-columns: 270px minmax(0, 1fr); gap: 18px; padding-top: 0; }
+  aside, article { background: white; border: 1px solid #d9e3e1; border-radius: 10px; padding: 16px; }
+  label { display: block; margin-bottom: 12px; }
+  input:not([type=checkbox]), select { display: block; width: 100%; margin-top: 4px; }
+  input, select, button { font: inherit; }
+  input:not([type=checkbox]), select { padding: 6px; border: 1px solid #a8bdb9; border-radius: 5px; background: white; }
+  button { cursor: pointer; padding: 7px 11px; border: 1px solid #176258; border-radius: 5px; background: #176258; color: white; }
+  button:disabled { opacity: .45; cursor: default; }
+  .toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin: 12px 0; }
+  .range { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .scroll { overflow: auto; max-height: 65vh; border: 1px solid #d9e3e1; border-radius: 5px; }
+  table { border-collapse: separate; border-spacing: 0; min-width: 100%; }
+  th, td { white-space: nowrap; padding: 7px 10px; text-align: left; border-bottom: 1px solid #e5eeec; }
+  th { position: sticky; top: 0; background: #e8f2f0; }
+  tbody tr:nth-child(even) { background: #f8faf9; }
+  th button { padding: 0; background: none; color: inherit; border: 0; font-weight: bold; white-space: nowrap; }
+  #status { color: #8b241d; }
+  @media (max-width: 760px) { main { grid-template-columns: minmax(0, 1fr); } }
+</style>
+</head>
+<body>
+<header><h1>RVI Collect</h1></header>
+<main>
+  <aside aria-label="Data and filters">
+    <label>CUH metadata (.tsv)<input id="metadata" type="file" accept=".tsv"></label>
+    <label>View
+      <select id="view">
+        <option value="metadata">CUH metadata only</option>
+        <option value="combined">Metadata + viral classification</option>
+      </select>
+    </label>
+    <label>Viral classification (.csv)<input id="classification" type="file" accept=".csv"></label>
+    <label><input id="dedup" type="checkbox" checked> Keep the second entry for duplicate Addenbrookes AnonSampleIDs</label>
+    <label>Sample origin
+      <select id="origin" multiple size="3">
+        <option>Addenbrookes</option><option>Control</option><option>Other</option>
+      </select>
+    </label>
+    <label>Sample IDs (seq_id)<input id="samples" placeholder="Separate IDs with commas or spaces"></label>
+    <label>Visible columns <small>(none selected = all)</small><select id="columns" multiple size="6"></select></label>
+    <div id="viralFilters" hidden>
+      <label>Virus<select id="virus" multiple size="5"></select></label>
+      <div class="range">
+        <label>Min. coverage (%)<input id="min" type="number" min="0" max="100" step="0.1" value="0"></label>
+        <label>Max. coverage (%)<input id="max" type="number" min="0" max="100" step="0.1" value="100"></label>
+      </div>
+      <label>FASTA source directory on the cluster
+        <input id="root" value="~/scratch/00_consensus/viral_lens_1.3.4">
+      </label>
+    </div>
+  </aside>
+  <article aria-label="Results">
+    <label>Search visible columns<input id="search" type="search"></label>
+    <label><input id="manual" type="checkbox"> Export checked rows only</label>
+    <div id="status" role="status"></div>
+    <div id="summary" aria-live="polite"></div>
+    <div class="toolbar">
+      <button id="tsv" disabled>Metadata (.tsv)</button>
+      <button id="script" disabled hidden>Collect FASTA (.sh)</button>
+    </div>
+    <div class="scroll" tabindex="0" aria-label="Results table">
+      <table><thead id="head"></thead><tbody id="body"></tbody></table>
+    </div>
+    <div class="toolbar">
+      <button id="prev" disabled>Previous</button>
+      <span id="page"></span>
+      <button id="next" disabled>Next</button>
+    </div>
+  </article>
+</main>
+<script>
+"use strict";
+
+const $ = id => document.getElementById(id);
+const coverage = "Percentage_of_Genome_Covered";
+const pathColumn = "fasta_relative_path";
+const required = {
+  metadata: ["seq_id", "Sample origin", "AnonSampleID"],
+  classification: ["Sample_ID", "Virus_Taxon_ID", "Virus", "Reference_Taxon_ID", coverage]
+};
+const data = { metadata: null, classification: null };
+const errors = {};
+const checked = new Set();
+const pageSize = 25;
+let rows = [], fields = [], exported = [], paths = [];
+let page = 0, sortField = "", ascending = true;
+
+function parseDelimited(text, delimiter, requiredColumns) {
+  text = text.replace(/^\uFEFF/, "");
+  const records = [];
+  let row = [], field = "", quoted = false;
+  function endRecord() {
+    row.push(field.trim());
+    if (row.some(Boolean)) records.push(row);
+    row = [];
+    field = "";
+  }
+  for (let i = 0; i < text.length; i++) {
+    const char = text[i];
+    if (quoted) {
+      if (char === '"' && text[i + 1] === '"') {
+        field += '"';
+        i++;
+      } else if (char === '"') {
+        quoted = false;
+      } else {
+        field += char;
+      }
+    } else if (char === '"' && !field.trim()) {
+      field = "";
+      quoted = true;
+    } else if (char === delimiter) {
+      row.push(field.trim());
+      field = "";
+    } else if (char === "\n" || char === "\r") {
+      if (char === "\r" && text[i + 1] === "\n") i++;
+      endRecord();
+    } else {
+      field += char;
+    }
+  }
+  if (quoted) throw new Error("Unclosed quoted field.");
+  endRecord();
+
+  const columns = records.shift() || [];
+  const missing = requiredColumns.filter(name => !columns.includes(name));
+  if (missing.length) throw new Error(`Missing columns: ${missing.join(", ")}.`);
+  if (new Set(columns).size !== columns.length) throw new Error("Duplicate column names.");
+  return {
+    columns,
+    rows: records.map((values, index) => {
+      if (values.length !== columns.length) {
+        throw new Error(`Data row ${index + 1} has ${values.length} fields; expected ${columns.length}.`);
+      }
+      return Object.fromEntries(columns.map((name, i) => [name, values[i]]));
+    })
+  };
+}
+
+function groupBy(records, key) {
+  const groups = new Map();
+  for (const record of records) {
+    const value = record[key];
+    if (!groups.has(value)) groups.set(value, []);
+    groups.get(value).push(record);
+  }
+  return groups;
+}
+
+function fastaPath(call) {
+  const id = call.Sample_ID;
+  const taxon = call.Reference_Taxon_ID;
+  if (!/^[0-9]+_[0-9]+_[0-9]+$/.test(id) || !/^[0-9]+$/.test(taxon)) return "";
+  const batchLane = id.slice(0, id.lastIndexOf("_"));
+  return `${batchLane}/${id}/${taxon}/${id}.${taxon}.consensus.fa`;
+}
+
+function buildRows(combined) {
+  const meta = data.metadata;
+  const calls = data.classification;
+  const keepSecond = $("dedup").checked;
+  const groups = groupBy(
+    meta.rows.filter(row => row["Sample origin"] === "Addenbrookes" && row.AnonSampleID),
+    "AnonSampleID"
+  );
+  const dropped = new Set();
+  if (keepSecond) {
+    for (const group of groups.values()) {
+      if (group.length > 1) group.forEach((row, index) => {
+        if (index !== 1) dropped.add(row);
+      });
+    }
+  }
+  const kept = meta.rows.filter(row => !dropped.has(row));
+  if (!combined) return { columns: meta.columns, rows: kept };
+
+  const retainedIds = new Set(kept.map(row => row.seq_id));
+  const excludedIds = new Set(
+    [...dropped].map(row => row.seq_id).filter(id => id && !retainedIds.has(id))
+  );
+  const validCalls = calls.rows.filter(row =>
+    row.Virus_Taxon_ID !== "Virus_Taxon_ID" && !excludedIds.has(row.Sample_ID)
+  );
+  const bySample = groupBy(validCalls.filter(row => row.Sample_ID), "Sample_ID");
+  const matched = new Set();
+  const joined = [];
+  function combine(metaRow, call) {
+    const result = { ...metaRow, seq_id: metaRow?.seq_id || call?.Sample_ID || "" };
+    if (call) {
+      for (const column of calls.columns) {
+        if (column !== "Sample_ID") result[column] = call[column];
+      }
+      result[pathColumn] = fastaPath(call);
+    }
+    return result;
+  }
+  for (const row of kept) {
+    const matches = row.seq_id ? bySample.get(row.seq_id) : undefined;
+    if (!matches) {
+      joined.push(combine(row));
+      continue;
+    }
+    for (const call of matches) {
+      matched.add(call);
+      joined.push(combine(row, call));
+    }
+  }
+  for (const call of validCalls) {
+    if (!matched.has(call)) joined.push(combine(null, call));
+  }
+  const available = new Set([...meta.columns, ...calls.columns.filter(c => c !== "Sample_ID"), pathColumn]);
+  const leading = ["seq_id", "AnonSampleID", "Virus", "Reference_Subtype", "Sample_Subtype",
+    "Flu_Segment", coverage, "Received", "Sample origin", "AgeGroup"];
+  return { columns: [...new Set([...leading.filter(c => available.has(c)), ...available])], rows: joined };
+}
+
+function selectedValues(id) {
+  return [...$(id).selectedOptions].map(option => option.value);
+}
+
+function setOptions(id, choices) {
+  const selection = new Set(selectedValues(id));
+  $(id).replaceChildren(...choices.map(value =>
+    new Option(value, value, false, selection.has(value))
+  ));
+}
+
+function refreshData() {
+  const combined = $("view").value === "combined";
+  $("viralFilters").hidden = !combined;
+  checked.clear();
+  page = 0;
+  if (data.metadata && (!combined || data.classification)) {
+    const result = buildRows(combined);
+    fields = result.columns;
+    rows = result.rows;
+  } else {
+    fields = [];
+    rows = [];
+  }
+  setOptions("columns", fields);
+  setOptions("virus", [...new Set(rows.map(row => row.Virus).filter(Boolean))].sort());
+  if (!fields.includes(sortField)) sortField = "";
+  render();
+}
+
+function render() {
+  const combined = $("view").value === "combined";
+  const origins = new Set(selectedValues("origin"));
+  const viruses = new Set(selectedValues("virus"));
+  const samples = new Set($("samples").value.split(/[\s,]+/).filter(Boolean));
+  const chosenColumns = selectedValues("columns");
+  const visible = chosenColumns.length ? chosenColumns : fields;
+  const search = $("search").value.trim().toLowerCase();
+  const min = $("min").value === "" ? 0 : Number($("min").value);
+  const max = $("max").value === "" ? 100 : Number($("max").value);
+  const badRange = combined && !(0 <= min && min <= max && max <= 100);
+  const notice = errors.metadata || (combined && errors.classification) ||
+    (!data.metadata && "Choose a CUH metadata TSV.") ||
+    (combined && !data.classification && "Choose a viral classification CSV.") ||
+    (badRange && "Enter a valid coverage range between 0 and 100.") || "";
+  $("status").textContent = notice;
+
+  const filtered = notice ? [] : rows.map((row, index) => ({ row, index })).filter(({ row }) => {
+    const source = row["Sample origin"];
+    const origin = ["Addenbrookes", "Control"].includes(source) ? source : source ? "Other" : "";
+    if (origins.size && !origins.has(origin)) return false;
+    if (samples.size && !samples.has(row.seq_id)) return false;
+    if (combined && viruses.size && !viruses.has(row.Virus)) return false;
+    if (combined && (min !== 0 || max !== 100)) {
+      const raw = row[coverage];
+      if (!raw || !(Number(raw) >= min && Number(raw) <= max)) return false;
+    }
+    return !search || visible.some(name => String(row[name] ?? "").toLowerCase().includes(search));
+  });
+
+  if (sortField) {
+    const direction = ascending ? 1 : -1;
+    filtered.sort((a, b) => direction * String(a.row[sortField] ?? "").localeCompare(
+      String(b.row[sortField] ?? ""), undefined, { numeric: true }
+    ));
+  }
+
+  exported = filtered.filter(item => !$("manual").checked || checked.has(item.index)).map(item => item.row);
+  paths = [...new Set(exported.map(row => row[pathColumn]).filter(Boolean))];
+  const sampleCount = new Set(exported.map(row => row.seq_id).filter(Boolean)).size;
+  $("summary").textContent = fields.length
+    ? `${sampleCount} samples · ${exported.length} rows to export${combined ? ` · ${paths.length} FASTA paths` : ""}`
+    : "";
+  $("tsv").disabled = !exported.length;
+  $("script").hidden = !combined;
+  $("script").disabled = !paths.length;
+
+  const pageCount = Math.ceil(filtered.length / pageSize);
+  page = Math.min(page, Math.max(0, pageCount - 1));
+  $("prev").disabled = page === 0;
+  $("next").disabled = page + 1 >= pageCount;
+  $("page").textContent = pageCount ? `Page ${page + 1} of ${pageCount}` : "No results";
+
+  const header = document.createElement("tr");
+  const selectHeading = document.createElement("th");
+  selectHeading.scope = "col";
+  selectHeading.textContent = "Select";
+  header.append(selectHeading);
+  for (const name of visible) {
+    const th = document.createElement("th");
+    th.scope = "col";
+    if (name === sortField) th.setAttribute("aria-sort", ascending ? "ascending" : "descending");
+    const button = document.createElement("button");
+    button.textContent = name + (name === sortField ? (ascending ? " ↑" : " ↓") : "");
+    button.onclick = () => {
+      ascending = name === sortField ? !ascending : true;
+      sortField = name;
+      page = 0;
+      render();
+    };
+    th.append(button);
+    header.append(th);
+  }
+  $("head").replaceChildren(...(visible.length ? [header] : []));
+
+  const body = document.createDocumentFragment();
+  for (const { row, index } of filtered.slice(page * pageSize, (page + 1) * pageSize)) {
+    const tr = document.createElement("tr");
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.checked = checked.has(index);
+    checkbox.setAttribute("aria-label", `Select ${row.seq_id || "row"} (${index + 1})`);
+    checkbox.onchange = () => {
+      if (checkbox.checked) checked.add(index);
+      else checked.delete(index);
+      render();
+    };
+    tr.insertCell().append(checkbox);
+    for (const name of visible) tr.insertCell().textContent = row[name] ?? "";
+    body.append(tr);
+  }
+  $("body").replaceChildren(body);
+}
+
+function download(filename, contents) {
+  const url = URL.createObjectURL(new Blob([contents], { type: "text/plain;charset=utf-8" }));
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  document.body.append(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function tsvField(value) {
+  const text = String(value ?? "");
+  return /["\t\r\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text;
+}
+
+function shellQuote(value) {
+  return "'" + value.replaceAll("'", "'\\''") + "'";
+}
+
+function makeScript(root, fastaPaths) {
+  const assignment = root.startsWith("~/")
+    ? 'root="$HOME"/' + shellQuote(root.slice(2))
+    : "root=" + shellQuote(root);
+  return [
+    "#!/bin/sh",
+    'dest="${1:-.}"',
+    assignment,
+    'mkdir -p -- "$dest" || exit 1',
+    "failed=0",
+    "copy_fasta() {",
+    '  source="$root/$1"',
+    '  target="$dest/${1##*/}"',
+    '  if [ ! -f "$source" ]; then',
+    '    printf "Missing FASTA file: %s\\n" "$source" >&2',
+    '    failed=1',
+    '  elif [ -e "$target" ] || [ -L "$target" ]; then',
+    '    if ! cmp -s -- "$source" "$target"; then',
+    '      printf "Destination already exists and differs or cannot be read: %s\\n" "$target" >&2',
+    '      failed=1',
+    '    fi',
+    '  elif ! cp -- "$source" "$target"; then',
+    '    failed=1',
+    '  fi',
+    "}",
+    ...fastaPaths.map(path => "copy_fasta " + shellQuote(path)),
+    'exit "$failed"',
+    ""
+  ].join("\n");
+}
+
+for (const id of ["metadata", "classification"]) {
+  $(id).onchange = async () => {
+    const file = $(id).files[0];
+    data[id] = null;
+    errors[id] = "";
+    refreshData();
+    if (!file) return;
+    try {
+      const text = await file.text();
+      if ($(id).files[0] !== file) return;
+      data[id] = parseDelimited(text, id === "metadata" ? "\t" : ",", required[id]);
+    } catch (error) {
+      if ($(id).files[0] !== file) return;
+      errors[id] = `${file.name}: ${error.message}`;
+    }
+    refreshData();
+  };
+}
+for (const id of ["view", "dedup"]) $(id).onchange = refreshData;
+for (const id of ["origin", "columns", "virus", "manual"]) {
+  $(id).onchange = () => { page = 0; render(); };
+}
+for (const id of ["samples", "search", "min", "max"]) {
+  $(id).oninput = () => { page = 0; render(); };
+}
+$("prev").onclick = () => { page--; render(); };
+$("next").onclick = () => { page++; render(); };
+$("tsv").onclick = () => {
+  const lines = [
+    fields.map(tsvField).join("\t"),
+    ...exported.map(row => fields.map(name => tsvField(row[name])).join("\t"))
+  ];
+  download("selected_metadata.tsv", lines.join("\n") + "\n");
+};
+$("script").onclick = () => {
+  const root = $("root").value.trim();
+  if (!/^(\/|~\/)/.test(root)) {
+    $("status").textContent = "Enter an absolute FASTA source directory or a path starting with ~/.";
+    $("root").focus();
+    return;
+  }
+  download("collect_fasta.sh", makeScript(root, paths));
+};
+refreshData();
+</script>
+</body>
+</html>
